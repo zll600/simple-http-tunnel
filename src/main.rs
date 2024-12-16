@@ -1,21 +1,35 @@
 use async_trait::async_trait;
 use clap::{self, Args, Parser, Subcommand};
+use conf::{DnsResolver, ProxyConfiguration, SimpleCachingDnsResolver};
 use derive_builder::Builder;
 use log::*;
-use regex::Regex;
 use serde::{self, Deserialize, Serialize};
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpListener,
     time::Duration,
 };
+use tunnel::EstablishTunnelResult;
+
+mod codec;
+mod conf;
+mod tunnel;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxy_configuration = ProxyConfiguration {
         bind_address: String::from("127.0.0.1:10086"),
+        tunnel_config: conf::TunnelConfig { 
+            client_connection: conf::ClientConnectionConfig {
+                connect_timeout:  Duration::from_secs(60),
+            } , 
+            target_connection:  conf::TargetConnectionConfig {
+                connect_timeout: Duration::from_secs(60),
+            },
+        } 
     };
-    let mut tcp_listener = TcpListener::bind(&proxy_configuration.bind_address)
+
+    let tcp_listener = TcpListener::bind(&proxy_configuration.bind_address)
         .await
         .map_err(|e| {
             error!(
@@ -25,15 +39,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             e
         })?;
 
-    let dns_resolver = DnsResolver {};
+    let dns_resolver = SimpleCachingDnsResolver::new(
+        proxy_configuration
+            .tunnel_config
+            .target_connection
+            .dns_cache_ttl,
+    );
     loop {
         // Asynchronously wait for an inbound socket.
         let socket = tcp_listener.accept().await;
 
-        let dns_resolver_ref = dns_resolver.clone();
-
         match socket {
             Ok((stream, _)) => {
+                let dns_resolver_ref = dns_resolver.clone();
                 let config = proxy_configuration.clone();
                 // handle accepted connections asynchronously
                 tokio::spawn(async move { tunnel_stream(&config, stream, dns_resolver_ref).await });
@@ -42,14 +60,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 }
-
-#[derive(Clone)]
-pub struct ProxyConfiguration {
-    bind_address: String,
-}
-
-#[derive(Clone)]
-pub struct DnsResolver {}
 
 /// Tunnel via a client connection.
 async fn tunnel_stream<C: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
@@ -61,7 +71,7 @@ async fn tunnel_stream<C: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
 }
 
 async fn relay_connection<
-D: AsyncRead + AsyncWrite + Sized + Send + Unpin + 'static,
+    D: AsyncRead + AsyncWrite + Sized + Send + Unpin + 'static,
     U: AsyncRead + AsyncWrite + Sized + Send + 'static,
 >(
     client: D,
@@ -70,10 +80,8 @@ D: AsyncRead + AsyncWrite + Sized + Send + Unpin + 'static,
     let (client_recv, client_send) = io::split(client);
     let (target_recv, target_send) = io::split(target);
 
-    let upstream_relay = Relay{
-    };
-    let downstream_relay = Relay{
-    };
+    let upstream_relay = Relay {};
+    let downstream_relay = Relay {};
     let upstream_task =
         tokio::spawn(async move { upstream_relay.relay_data(client_recv, target_send).await });
 
@@ -135,10 +143,8 @@ impl Relay {
                 }
             };
         }
-        let res = RelayStats{
-            shutdown_reason,
-        };
-        return Ok((res))
+        let res = RelayStats { shutdown_reason };
+        return Ok((res));
     }
 }
 
@@ -171,28 +177,6 @@ pub enum RelayShutdownReasons {
 // {
 // }
 
-#[derive(Serialize)]
-pub enum EstablishTunnelResult {
-    /// Successfully connected to target.  
-    Ok,
-    /// Malformed request
-    BadRequest,
-    /// Target is not allowed
-    Forbidden,
-    /// Unsupported operation, however valid for the protocol.
-    OperationNotAllowed,
-    /// The client failed to send a tunnel request timely.
-    RequestTimeout,
-    /// Cannot connect to target.
-    BadGateway,
-    /// Connection attempt timed out.
-    GatewayTimeout,
-    /// Busy. Try again later.
-    TooManyRequests,
-    /// Any other error. E.g. an abrupt I/O error.
-    ServerError,
-}
-
 /// Stats after the relay is closed. Can be used for telemetry/monitoring.
 #[derive(Builder, Clone, Debug, Serialize)]
 pub struct RelayStats {
@@ -202,11 +186,6 @@ pub struct RelayStats {
     // pub duration: Duration,
 }
 
-// #[derive(Display)]
-// pub struct TunnelCtx {
-
-// }
-
 /// Statistics. No sensitive information.
 #[derive(Serialize)]
 pub struct TunnelStats {
@@ -215,7 +194,6 @@ pub struct TunnelStats {
     upstream_stats: Option<RelayStats>,
     downstream_stats: Option<RelayStats>,
 }
-
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -254,17 +232,6 @@ enum Commands {
     Http(HttpOptions),
     Https(HttpsOptions),
     Tcp(TcpOptions),
-}
-
-#[derive(Deserialize, Clone)]
-pub struct TargetConnectionConfig {
-    #[serde(with = "humantime_serde")]
-    pub dns_cache_ttl: Duration,
-    #[serde(with = "serde_regex")]
-    pub allowed_targets: Regex,
-    #[serde(with = "humantime_serde")]
-    pub connect_timeout: Duration,
-    pub relay_policy: RelayPolicy,
 }
 
 #[derive(Builder, Deserialize, Clone)]
