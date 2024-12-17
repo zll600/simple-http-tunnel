@@ -8,8 +8,10 @@ async-trait = "0.1.83"
 bytes = "1.9.0"
 clap = { version="4.5.23", features = ["derive"]}
 derive_builder = "0.20.2"
+futures = "0.3.31"
 humantime-serde = "1.1.1"
 log = "0.4.22"
+rand = "0.8.5"
 regex = "1.11.1"
 serde = { version = "1.0.215", features = ["derive"] }
 serde_regex = "1.1.0"

@@ -1,10 +1,8 @@
+use std::time::Instant;
+
 use regex::Regex;
 use serde::{self, Deserialize};
 use tokio::time::Duration;
-
-pub struct SimpleCachingDnsResolver {}
-
-pub type DnsResolver = SimpleCachingDnsResolver;
 
 #[derive(Clone)]
 pub struct ProxyConfiguration {

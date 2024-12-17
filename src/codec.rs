@@ -4,10 +4,9 @@ use std::{str::Split, sync::Arc};
 use bytes::BytesMut;
 use derive_builder::Builder;
 use log::debug;
-use regex::Regex;
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::tunnel::{EstablishTunnelResult, TunnelCtx};
+use crate::tunnel::{EstablishTunnelResult, HttpTunnelTarget, HttpTunnelTargetBuilder, TunnelCtx};
 
 const REQUEST_END_MARKER: &[u8] = b"\r\n\r\n";
 /// A reasonable value to limit possible header size.
@@ -15,14 +14,10 @@ const MAX_HTTP_REQUEST_SIZE: usize = 16384; // 1024 * 16
 
 const HOST_HEADER: &str = "host:";
 
+#[derive(Builder, Clone)]
 pub struct HttpTunnelCodec {
     tunnel_ctx: TunnelCtx,
-    enabled_destinations: Regex,
-}
-
-#[derive(Builder)]
-pub struct HttpTunnelTarget {
-    target: String,
+    // enabled_targets: Regex,
 }
 
 impl Decoder for HttpTunnelCodec {
@@ -36,13 +31,13 @@ impl Decoder for HttpTunnelCodec {
 
         match HttpConnectRequest::parse(&src) {
             Ok(parsed_request) => {
-                if !self.enabled_destinations.is_match(&parsed_request.uri) {
-                    debug!(
-                        "Destination `{}` is not allowed. Allowed: `{}`, CTX={}",
-                        parsed_request.uri, self.enabled_destinations, self.tunnel_ctx
-                    );
-                    return Err(EstablishTunnelResult::Forbidden);
-                }
+                // if !self.enabled_destinations.is_match(&parsed_request.uri) {
+                //     debug!(
+                //         "Destination `{}` is not allowed. Allowed: `{}`, CTX={}",
+                //         parsed_request.uri, self.enabled_destinations, self.tunnel_ctx
+                //     );
+                //     return Err(EstablishTunnelResult::Forbidden);
+                // }
                 return Ok(Some(
                     HttpTunnelTargetBuilder::default()
                         .target(parsed_request.uri)
@@ -65,6 +60,7 @@ impl Encoder<EstablishTunnelResult> for HttpTunnelCodec {
     ) -> Result<(), Self::Error> {
         let (code, message) = match item {
             EstablishTunnelResult::Ok => (200, "OK"),
+            EstablishTunnelResult::OkWithNugget => (200, "OK"),
             EstablishTunnelResult::BadRequest => (400, "BAD_REQUEST"),
             EstablishTunnelResult::Forbidden => (403, "FORBIDDEN"),
             EstablishTunnelResult::OperationNotAllowed => (405, "NOT_ALLOWED"),
@@ -208,6 +204,7 @@ impl HttpConnectRequest {
     }
 }
 
+#[derive(Clone)]
 pub struct Nugget {
     data: Arc<Vec<u8>>,
 }
