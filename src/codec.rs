@@ -6,7 +6,7 @@ use derive_builder::Builder;
 use log::debug;
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::tunnel::{EstablishTunnelResult, HttpTunnelTarget, HttpTunnelTargetBuilder, TunnelCtx};
+use crate::tunnel::{EstablishTunnelResult, HttpTunnelTarget, HttpTunnelTargetBuilder};
 
 const REQUEST_END_MARKER: &[u8] = b"\r\n\r\n";
 /// A reasonable value to limit possible header size.
