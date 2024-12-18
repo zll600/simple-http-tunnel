@@ -7,7 +7,6 @@ use tokio::time::Duration;
 #[derive(Clone)]
 pub struct ProxyConfiguration {
     pub bind_address: String,
-    pub tunnel_config: TunnelConfig,
 }
 
 #[derive(Clone)]

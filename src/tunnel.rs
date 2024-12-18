@@ -10,7 +10,6 @@ use std::{
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpStream,
-    time::Duration,
 };
 
 use derive_builder::Builder;
@@ -18,7 +17,7 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
-use crate::{codec::Nugget, conf::TunnelConfig};
+use crate::codec::Nugget;
 
 #[derive(Builder, Clone, Debug)]
 pub struct TunnelCtx {
@@ -112,19 +111,13 @@ pub trait TargetConnector {
 }
 
 pub struct SimpleTcpConnector<D> {
-    connect_timeout: Duration,
-    // tunnel_ctx: TunnelCtx,
-    // dns_resolver: R,
     // #[builder(setter(skip))]
     _phantom_target: PhantomData<D>,
 }
 
 impl<D> SimpleTcpConnector<D> {
-    pub fn new(connect_timeout: Duration) -> Self {
+    pub fn new() -> Self {
         Self {
-            // dns_resolver,
-            connect_timeout,
-            // tunnel_ctx,
             _phantom_target: PhantomData,
         }
     }
@@ -141,7 +134,6 @@ where
     async fn connect(&mut self, target: &Self::Target) -> io::Result<Self::Stream> {
         let target_addr = &target.target_addr();
 
-        // let addr = self.dns_resolver.resolve(target_addr).await?;
         let addr = target_addr;
 
         match TcpStream::connect(addr).await {
@@ -183,7 +175,6 @@ pub struct ConnectionTunnel<H, C, T> {
     tunnel_request_codec: Option<H>,
     target_connector: T,
     client: Option<C>,
-    tunnel_config: TunnelConfig,
 }
 
 impl<H, C, T> ConnectionTunnel<H, C, T>
@@ -193,17 +184,11 @@ where
     C: AsyncRead + AsyncWrite + Sized + Send + Unpin + 'static,
     T: TargetConnector<Target = H::Item>,
 {
-    pub fn new(
-        handshake_codec: H,
-        target_connector: T,
-        client: C,
-        tunnel_config: TunnelConfig,
-    ) -> Self {
+    pub fn new(handshake_codec: H, target_connector: T, client: C) -> Self {
         Self {
             tunnel_request_codec: Some(handshake_codec),
             target_connector,
             client: Some(client),
-            tunnel_config,
         }
     }
 
@@ -220,9 +205,7 @@ where
     pub async fn start(mut self) -> io::Result<TunnelStats> {
         let stream = self.client.take().expect("downstream can be taken once");
 
-        let tunnel_result = self
-            .establish_tunnel(stream, self.tunnel_config.clone())
-            .await;
+        let tunnel_result = self.establish_tunnel(stream).await;
 
         if let Err(error) = tunnel_result {
             return Ok(TunnelStats { result: error });
@@ -235,7 +218,6 @@ where
     async fn establish_tunnel(
         &mut self,
         stream: C,
-        configuration: TunnelConfig,
     ) -> Result<(C, T::Stream), EstablishTunnelResult> {
         let (mut write, mut read) = self
             .tunnel_request_codec
@@ -244,7 +226,7 @@ where
             .framed(stream)
             .split();
 
-        let (response, target) = self.process_tunnel_request(&configuration, &mut read).await;
+        let (response, target) = self.process_tunnel_request(&mut read).await;
 
         let response_sent = match response {
             EstablishTunnelResult::OkWithNugget => true,
@@ -269,7 +251,6 @@ where
 
     async fn process_tunnel_request(
         &mut self,
-        configuration: &TunnelConfig,
         read: &mut SplitStream<Framed<C, H>>,
     ) -> (
         EstablishTunnelResult,
@@ -284,13 +265,7 @@ where
             match event {
                 Ok(decoded_target) => {
                     let has_nugget = decoded_target.has_nugget();
-                    response = match self
-                        .connect_to_target(
-                            decoded_target,
-                            configuration.target_connection.connect_timeout,
-                        )
-                        .await
-                    {
+                    response = match self.connect_to_target(decoded_target).await {
                         Ok(t) => {
                             target = Some(t);
                             if has_nugget {
@@ -316,7 +291,6 @@ where
     async fn connect_to_target(
         &mut self,
         target: T::Target,
-        connect_timeout: Duration,
     ) -> Result<T::Stream, EstablishTunnelResult> {
         debug!("Establishing HTTP tunnel target connection: {}", target);
 

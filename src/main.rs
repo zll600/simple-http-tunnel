@@ -1,17 +1,18 @@
-use clap::{self, Args, Parser, Subcommand};
 use codec::{HttpTunnelCodec, HttpTunnelCodecBuilder};
-use conf::ProxyConfiguration;
 use derive_builder::Builder;
+use futures::{SinkExt, StreamExt};
 use log::*;
 use rand::{thread_rng, Rng};
-use serde::{self, Deserialize, Serialize};
+use serde::{self, Deserialize};
 use tokio::{
-    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
+    io::{self, AsyncRead, AsyncWrite},
     net::TcpListener,
     time::Duration,
 };
+use tokio_util::codec::Decoder;
 use tunnel::{
-    ConnectionTunnel, EstablishTunnelResult, HttpTunnelTarget, SimpleTcpConnector, TunnelCtxBuilder,
+    EstablishTunnelResult, HttpTunnelTarget, Relay, RelayBuilder, SimpleTcpConnector,
+    TargetConnector, TunnelCtxBuilder, TunnelTarget,
 };
 
 mod codec;
@@ -20,28 +21,15 @@ mod tunnel;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proxy_configuration = ProxyConfiguration {
-        bind_address: String::from("127.0.0.1:10086"),
-        tunnel_config: conf::TunnelConfig {
-            client_connection: conf::ClientConnectionConfig {
-                connect_timeout: Duration::from_secs(60),
-            },
-            target_connection: conf::TargetConnectionConfig {
-                connect_timeout: Duration::from_secs(60),
-            },
-        },
-    };
+    let bind_address = "127.0.0.1:10086";
 
-    let tcp_listener = match TcpListener::bind(&proxy_configuration.bind_address).await {
+    let tcp_listener = match TcpListener::bind(bind_address).await {
         Ok(s) => {
-            info!("Serve request on: {}", &proxy_configuration.bind_address);
+            info!("Serve request on: {}", bind_address);
             s
         }
         Err(e) => {
-            panic!(
-                "Error binding address {}: {}",
-                &proxy_configuration.bind_address, e
-            );
+            panic!("Error binding address {}: {}", bind_address, e);
         }
     };
 
@@ -51,9 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match socket {
             Ok((stream, _)) => {
-                let config = proxy_configuration.clone();
                 // handle accepted connections asynchronously
-                tokio::spawn(async move { tunnel_stream(&config, stream).await });
+                tokio::spawn(async move { tunnel_stream(stream).await });
             }
             Err(e) => error!("Failed TCP handshake {}", e),
         }
@@ -62,7 +49,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Tunnel via a client connection.
 async fn tunnel_stream<C: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
-    config: &ProxyConfiguration,
     client_connection: C,
 ) -> io::Result<()> {
     let ctx = TunnelCtxBuilder::default()
@@ -77,57 +63,85 @@ async fn tunnel_stream<C: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
         .expect("HttpTunnelCodecBuilder failed");
 
     // any `TargetConnector` would do.
-    let connector: SimpleTcpConnector<HttpTunnelTarget> =
-        SimpleTcpConnector::new(config.tunnel_config.target_connection.connect_timeout);
+    let mut connector: SimpleTcpConnector<HttpTunnelTarget> = SimpleTcpConnector::new();
 
-    let stats = ConnectionTunnel::new(
-        codec,
-        connector,
-        client_connection,
-        config.tunnel_config.clone(),
-    )
-    .start()
-    .await;
-    return Ok(());
-}
+    let (mut write, mut read) = codec.framed(client_connection).split();
 
-#[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-#[clap(propagate_version = true)]
-struct Cli {
-    /// Configuration file.
-    #[clap(long)]
-    config: Option<String>,
-    /// Bind address, e.g. 0.0.0.0:8443.
-    #[clap(long)]
-    bind: String,
-    #[clap(subcommand)]
-    command: Commands,
-}
+    let connect_request = read.next().await;
 
-#[derive(Args, Debug)]
-#[clap(about = "Run the tunnel in HTTP mode", long_about = None)]
-#[clap(author, version, long_about = None)]
-#[clap(propagate_version = true)]
-struct HttpOptions {}
+    let response;
+    let mut target = None;
 
-#[derive(Args, Debug)]
-#[clap(about = "Run the tunnel in HTTPS mode", long_about = None)]
-#[clap(author, version, long_about = None)]
-#[clap(propagate_version = true)]
-struct HttpsOptions {}
+    if let Some(event) = connect_request {
+        match event {
+            Ok(decoded_target) => {
+                let has_nugget = decoded_target.has_nugget();
+                let tcp_stream = connector.connect(&decoded_target).await;
 
-#[derive(Args, Debug)]
-#[clap(about = "Run the tunnel in TCP proxy mode", long_about = None)]
-#[clap(author, version, long_about = None)]
-#[clap(propagate_version = true)]
-struct TcpOptions {}
+                response = match connector.connect(&decoded_target).await {
+                    Ok(t) => {
+                        target = Some(t);
+                        if has_nugget {
+                            EstablishTunnelResult::OkWithNugget
+                        } else {
+                            EstablishTunnelResult::Ok
+                        }
+                    }
+                    Err(e) => EstablishTunnelResult::from(e),
+                }
+            }
+            Err(e) => {
+                response = e;
+            }
+        }
+    } else {
+        response = EstablishTunnelResult::BadRequest;
+    }
 
-#[derive(Subcommand, Debug)]
-enum Commands {
-    Http(HttpOptions),
-    Https(HttpsOptions),
-    Tcp(TcpOptions),
+    let response_sent = match response {
+        EstablishTunnelResult::OkWithNugget => true,
+        _ => write.send(response.clone()).await.is_ok(),
+    };
+
+    if !response_sent {
+        panic!("fail to connect target");
+    }
+    let (client_stream, target_stream) = match target {
+        None => panic!("fail to connect target"),
+        Some(u) => {
+            // lets take the original stream to either relay data, or to drop it on error
+            let framed = write.reunite(read).expect("Uniting previously split parts");
+            let original_stream = framed.into_inner();
+            (original_stream, u)
+        }
+    };
+    let (client_recv, client_send) = io::split(client_stream);
+    let (target_recv, target_send) = io::split(target_stream);
+
+    let downstream_relay: Relay = RelayBuilder::default()
+        .name("Downstream")
+        // .tunnel_ctx(ctx)
+        // .relay_policy(downstream_relay_policy)
+        .build()
+        .expect("RelayBuilder failed");
+
+    let upstream_relay: Relay = RelayBuilder::default()
+        .name("Upstream")
+        // .tunnel_ctx(ctx)
+        // .relay_policy(upstream_relay_policy)
+        .build()
+        .expect("RelayBuilder failed");
+
+    let upstream_task =
+        tokio::spawn(async move { downstream_relay.relay_data(client_recv, target_send).await });
+
+    let downstream_task =
+        tokio::spawn(async move { upstream_relay.relay_data(target_recv, client_send).await });
+
+    let downstream_stats = downstream_task.await??;
+    let upstream_stats = upstream_task.await??;
+
+    Ok(())
 }
 
 #[derive(Builder, Deserialize, Clone)]
@@ -139,47 +153,3 @@ pub struct RelayPolicy {
     // Max bytes-per-second (bps)
     pub max_rate_bps: u64,
 }
-
-// #[tokio::test]
-// async fn test_timed_operation_timeout() {
-//     let time_duration = 1;
-//     let data = b"data on the wire";
-//     let mut mock_connection: Mock = Builder::new()
-//         .wait(Duration::from_secs(time_duration * 2))
-//         .read(data)
-//         .build();
-
-//     let relay_policy: RelayPolicy = RelayPolicyBuilder::default()
-//         .min_rate_bpm(1000)
-//         .max_rate_bps(100_000)
-//         .idle_timeout(Duration::from_secs(time_duration))
-//         .build()
-//         .unwrap();
-
-//     let mut buf = [0; 1024];
-//     let timed_future = relay_policy
-//         .timed_operation(mock_connection.read(&mut buf))
-//         .await;
-//     assert!(timed_future.is_err());
-// }
-
-// #[tokio::test]
-// async fn test_timed_operation_failed_io() {
-//     let mut mock_connection: Mock = Builder::new()
-//         .read_error(Error::from(ErrorKind::BrokenPipe))
-//         .build();
-
-//     let relay_policy: RelayPolicy = RelayPolicyBuilder::default()
-//         .min_rate_bpm(1000)
-//         .max_rate_bps(100_000)
-//         .idle_timeout(Duration::from_secs(5))
-//         .build()
-//         .unwrap();
-
-//     let mut buf = [0; 1024];
-//     let timed_future = relay_policy
-//         .timed_operation(mock_connection.read(&mut buf))
-//         .await;
-//     assert!(timed_future.is_ok()); // no timeout
-//     assert!(timed_future.unwrap().is_err()); // but io-error
-// }
