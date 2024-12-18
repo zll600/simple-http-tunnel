@@ -1,18 +1,14 @@
 use codec::{HttpTunnelCodec, HttpTunnelCodecBuilder};
-use derive_builder::Builder;
 use futures::{SinkExt, StreamExt};
 use log::*;
-use rand::{thread_rng, Rng};
-use serde::{self, Deserialize};
 use tokio::{
     io::{self, AsyncRead, AsyncWrite},
     net::TcpListener,
-    time::Duration,
 };
 use tokio_util::codec::Decoder;
 use tunnel::{
     EstablishTunnelResult, HttpTunnelTarget, Relay, RelayBuilder, SimpleTcpConnector,
-    TargetConnector, TunnelCtxBuilder, TunnelTarget,
+    TargetConnector, TunnelTarget,
 };
 
 mod codec;
@@ -51,14 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn tunnel_stream<C: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     client_connection: C,
 ) -> io::Result<()> {
-    let ctx = TunnelCtxBuilder::default()
-        .id(thread_rng().gen::<u128>())
-        .build()
-        .expect("TunnelCtxBuilder failed");
-
     // here it can be any codec.
     let codec: HttpTunnelCodec = HttpTunnelCodecBuilder::default()
-        .tunnel_ctx(ctx)
         .build()
         .expect("HttpTunnelCodecBuilder failed");
 
@@ -142,14 +132,4 @@ async fn tunnel_stream<C: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     let upstream_stats = upstream_task.await??;
 
     Ok(())
-}
-
-#[derive(Builder, Deserialize, Clone)]
-pub struct RelayPolicy {
-    #[serde(with = "humantime_serde")]
-    pub idle_timeout: Duration,
-    /// Min bytes-per-minute (bpm)
-    pub min_rate_bpm: u64,
-    // Max bytes-per-second (bps)
-    pub max_rate_bps: u64,
 }

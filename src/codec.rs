@@ -16,7 +16,7 @@ const HOST_HEADER: &str = "host:";
 
 #[derive(Builder, Clone)]
 pub struct HttpTunnelCodec {
-    tunnel_ctx: TunnelCtx,
+    // tunnel_ctx: TunnelCtx,
     // enabled_targets: Regex,
 }
 
